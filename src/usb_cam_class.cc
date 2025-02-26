@@ -1,9 +1,12 @@
 #include "matplotlibcpp.h"
+#include <CL/cl.h>
 #include <atomic>
 #include <chrono>
 #include <fcntl.h>
 #include <iostream>
 #include <linux/videodev2.h>
+#include <opencv2/core/mat.hpp>
+#include <opencv2/core/ocl.hpp>
 #include <opencv2/opencv.hpp>
 #include <stdexcept>
 #include <string>
@@ -38,6 +41,8 @@ private:
   int fd_ = -1;
   FrameBuffer buffers_[BUFFER_COUNT];
   std::atomic<bool> running_{false};
+
+  bool use_opencl_{false};
 
   void xioctl(unsigned long request, void *arg, std::string error_msg = "") {
     int r;
@@ -83,6 +88,61 @@ private:
     return epoch_us - uptime_us;
   }
 
+  bool checkOpenCVOpenCL() {
+    bool have_opencl = cv::ocl::haveOpenCL();
+    bool use_opencl = cv::ocl::useOpenCL();
+
+    if (have_opencl) {
+      if (use_opencl) {
+        std::cout << "OpenCL enabled" << std::endl;
+      } else {
+        std::cout << "OpenCL disabled, try to enable now ..." << std::endl;
+        cv::ocl::setUseOpenCL(true);
+        if (cv::ocl::useOpenCL()) {
+          std::cout << "OpenCL enabled" << std::endl;
+        } else {
+          std::cout << "set OpenCL failed" << std::endl;
+          return false;
+        }
+      }
+    } else {
+      std::cout << "OpenCL not available" << std::endl;
+      return false;
+    }
+
+    std::vector<cv::ocl::PlatformInfo> plats;
+    cv::ocl::getPlatfomsInfo(plats);
+    for (int i = 0; i < plats.size(); i++) {
+      std::cout << "OpenCL Platform: " << plats[i].name() << std::endl;
+    }
+    return cv::ocl::useOpenCL();
+  }
+
+  cv::UMat create_umat_from_ptr(void *ptr, int rows, int cols, int type) {
+    cl_context ctx = (cl_context)cv::ocl::Context::getDefault().ptr();
+    cl_mem cl_buffer =
+        clCreateBuffer(ctx, CL_MEM_USE_HOST_PTR,
+                       rows * cols * CV_ELEM_SIZE(type), ptr, nullptr);
+
+    cv::UMat umat;
+    umat.create(rows, cols, type);
+    umat.u->handle = cl_buffer;
+    umat.u->currAllocator = cv::ocl::getOpenCLAllocator();
+    return umat;
+  }
+
+  cv::Mat yuyv_to_bgr_cl(const void *yuyv_data) {
+    cv::UMat yuyv_mat = create_umat_from_ptr((void *)yuyv_data, CAPTURE_HEIGHT,
+                                             CAPTURE_WIDTH, CV_8UC2);
+
+    cv::UMat bgr_umat;
+    cv::cvtColor(yuyv_mat, bgr_umat, cv::COLOR_YUV2BGR_YUYV);
+
+    cv::Mat bgr;
+    bgr_umat.copyTo(bgr);
+    return bgr;
+  }
+
 public:
   ~V4L2Camera() {
     if (fd_ != -1) {
@@ -91,6 +151,8 @@ public:
   }
 
   void init() {
+    // 0. check OpenCL
+    use_opencl_ = checkOpenCVOpenCL();
     // 1. 打开设备
     fd_ = open(DEVICE_PATH, O_RDWR);
     if (fd_ < 0) {
@@ -152,7 +214,6 @@ public:
     uint64_t toEpochOffset_us = getEpochTimeShift();
 
     while (frames.size() < num_frames && running_) {
-      /* auto begin = high_resolution_clock::now();*/
       fd_set fds;
       FD_ZERO(&fds);
       FD_SET(fd_, &fds);
@@ -175,20 +236,28 @@ public:
       printf("the hw tp %ld us\n", temp_us + toEpochOffset_us);
 
       // 转换格式+记录时间戳
-      // cv::Mat bgr = yuyv_to_bgr(buffers_[buf.index].start);
+
+      auto begin = high_resolution_clock::now();
+      cv::Mat bgr = yuyv_to_bgr(buffers_[buf.index].start);
+      auto end = high_resolution_clock::now();
+
+      std::cout << "cpu convert cost:"
+                << duration_cast<microseconds>(end - begin).count() << " us"
+                << std::endl;
+
+      auto begin_cl = high_resolution_clock::now();
+      // cv::Mat bgr_cl = yuyv_to_bgr_cl(buffers_[buf.index].start);
+      auto end_cl = high_resolution_clock::now();
+      std::cout << "cl convert cost:"
+                << duration_cast<microseconds>(end_cl - begin_cl).count() << " us"
+                << std::endl;
+
       frames.push_back({temp_us + toEpochOffset_us});
 
-      // cv::imshow("USB Camera", bgr);
+      // cv::imshow("USB Camera", bgr_cl);
       // cv::waitKey(1);
 
       xioctl(VIDIOC_QBUF, &buf, "VIDIOC_QBUF");
-
-      /* auto end = high_resolution_clock::now();
-      std::cout << "loop cost: "
-                << duration_cast<milliseconds>(end - begin).count()
-                << " ms, fps: "
-                << 1000.0f / duration_cast<milliseconds>(end - begin).count()
-                << std::endl; */
     }
 
     return frames;

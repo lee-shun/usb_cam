@@ -8,6 +8,11 @@ set(CMAKE_CXX_FLAGS "-O3 -march=native")
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
+# 查找OpenCL
+find_package(OpenCL REQUIRED)
+include_directories(${OpenCL_INCLUDE_DIRS})
+
+# Python
 find_package(Python COMPONENTS Development NumPy REQUIRED)
 include_directories(${Python_INCLUDE_DIRS} ${Python_NumPy_INCLUDE_DIRS})
 
@@ -25,6 +30,7 @@ target_link_libraries(usb_cam
 )
 target_link_libraries(usb_cam_class
     ${OpenCV_LIBS}
+    ${OpenCL_LIBRARIES}
     ${Python_LIBRARIES}
     pthread
     rt
