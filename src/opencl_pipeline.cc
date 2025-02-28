@@ -121,9 +121,10 @@ public:
 
     // upload data
     auto upload_event = std::make_shared<cl::Event>();
+    std::cout << width_ * height_ * 2 << std::endl;
+    std::cout << frame.yuv.total() * frame.yuv.elemSize() << std::endl;
     cl_com_queue_.enqueueWriteBuffer(cl_in_bufs_.back(), CL_FALSE, 0,
-                                     frame.yuv.total() * frame.yuv.elemSize(),
-                                     frame.yuv.data, nullptr,
+                                     1920 * 1080 * 2, frame.yuv.data, nullptr,
                                      upload_event.get());
     cl_upload_events_.push(upload_event);
 
@@ -143,8 +144,7 @@ public:
     auto download_event = std::make_shared<cl::Event>();
     std::vector<cl::Event> k_events = {*kernel_event};
     cl_com_queue_.enqueueReadBuffer(cl_out_bufs_.back(), CL_FALSE, 0,
-                                    frame.rgb.total() * frame.rgb.elemSize(),
-                                    frame.rgb.data, &k_events,
+                                    1920 * 1080 * 3, frame.rgb.data, &k_events,
                                     download_event.get());
     cl_download_events_.push(download_event);
     output_queue_.push(frame);
