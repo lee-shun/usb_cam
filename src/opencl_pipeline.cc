@@ -1,3 +1,8 @@
+#include <CL/cl2.hpp>
+#include <memory>
+#include <opencv2/opencv.hpp>
+#include <fstream>
+
 #include "matplotlibcpp.h"
 #include <algorithm>
 #include <cstdint>
@@ -22,6 +27,117 @@
 #define BUFFER_COUNT 4
 namespace plt = matplotlibcpp;
 
+struct FrameData {
+  uint64_t capture_ts;
+  cv::Mat rgb;
+  cv::Mat yuv;
+  int width;
+  int height;
+};
+
+class AsyncProcessor {
+public:
+  AsyncProcessor(int width, int height) : width_(width), height_(height) {
+    cl::Device device = cl::Device::getDefault();
+    context_ = cl::Context(device);
+    cl_com_queue_ = cl::CommandQueue(context_, device,
+                                     CL_QUEUE_PROFILING_ENABLE);
+
+    std::ifstream kernel_file("yuv_rgb.cl");
+    std::string src(std::istreambuf_iterator<char>(kernel_file),
+                    (std::istreambuf_iterator<char>()));
+    auto program_ = cl::Program(context_, src);
+    program_.build();
+    kernel_ = cl::Kernel(program_, "yuv2rgb");
+
+    std::cout << "before compile" << std::endl;
+    program_.build();
+    std::cout << "after compile" << std::endl;
+
+  }
+
+  bool input(FrameData &frame) {
+    std::lock_guard<std::mutex> lock(que_mutex_);
+    auto tmp_in_buf =
+        cl::Buffer(context_, CL_MEM_READ_ONLY, width_ * height_ * 2);
+    cl_in_bufs_.push(tmp_in_buf);
+    auto tmp_out_buf =
+        cl::Buffer(context_, CL_MEM_WRITE_ONLY, width_ * height_ * 3);
+    cl_out_bufs_.push(tmp_out_buf);
+
+    // upload data
+    auto upload_event = std::make_shared<cl::Event>();
+    cl_com_queue_.enqueueWriteBuffer(
+        cl_in_bufs_.back(), CL_FALSE, 0, width_ * height_ * 2,
+        frame.yuv.data, nullptr, upload_event.get());
+    cl_upload_events_.push(upload_event);
+
+    // execute kernel
+    auto kernel_event = std::make_shared<cl::Event>();
+    kernel_.setArg(0, cl_in_bufs_.back());
+    kernel_.setArg(1, cl_out_bufs_.back());
+    kernel_.setArg(2, width_);
+    kernel_.setArg(3, height_);
+    std::vector<cl::Event> up_events = {*upload_event};
+    cl_com_queue_.enqueueNDRangeKernel(
+        kernel_, cl::NullRange, cl::NDRange(width_/2, height_), cl::NullRange,
+        &up_events, kernel_event.get());
+    cl_kernel_events_.push(kernel_event);
+
+    // download
+    auto download_event = std::make_shared<cl::Event>();
+    std::vector<cl::Event> k_events = {*kernel_event};
+    cl_com_queue_.enqueueReadBuffer(
+        cl_out_bufs_.back(), CL_FALSE, 0, width_ * height_ * 3,
+        frame.rgb.data, &k_events, download_event.get());
+    cl_download_events_.push(download_event);
+    output_queue_.push(frame);
+    return true;
+  }
+
+  bool get_result(FrameData &frame) {
+    std::lock_guard<std::mutex> lock(que_mutex_);
+
+    if (cl_download_events_.empty() || cl_upload_events_.empty() ||
+        cl_kernel_events_.empty()) {
+      std::cout << "events empty" << std::endl;
+      return false;
+    }
+
+    if (cl_upload_events_.front()
+                ->getInfo<CL_EVENT_COMMAND_EXECUTION_STATUS>() == CL_COMPLETE &&
+        cl_kernel_events_.front()
+                ->getInfo<CL_EVENT_COMMAND_EXECUTION_STATUS>() == CL_COMPLETE &&
+        cl_download_events_.front()
+                ->getInfo<CL_EVENT_COMMAND_EXECUTION_STATUS>() == CL_COMPLETE) {
+      cl_in_bufs_.pop();
+      cl_out_bufs_.pop();
+      cl_upload_events_.pop();
+      cl_kernel_events_.pop();
+      cl_download_events_.pop();
+      frame = output_queue_.front();
+      output_queue_.pop();
+
+      return true;
+    }
+    return false;
+  }
+
+private:
+  cl::Context context_;
+  cl::Kernel kernel_;
+  cl::CommandQueue cl_com_queue_;
+
+  int width_, height_;
+
+  std::mutex que_mutex_;
+  std::queue<FrameData> output_queue_;
+  std::queue<cl::Buffer> cl_in_bufs_,cl_out_bufs_;
+  std::queue<std::shared_ptr<cl::Event>> cl_upload_events_, cl_kernel_events_,
+      cl_download_events_;
+};
+
+
 // 实时性设置
 void enable_realtime() {
   struct sched_param param = {.sched_priority = 99};
@@ -36,11 +152,6 @@ void enable_realtime() {
   }
 }
 
-struct FrameData {
-public:
-  uint64_t timestamp;
-};
-
 void analyze_and_plot_intervals(std::vector<FrameData> &frames,
                                 std::string name = "1") {
   if (frames.size() < 2) {
@@ -53,7 +164,7 @@ void analyze_and_plot_intervals(std::vector<FrameData> &frames,
   // 计算时间间隔（微秒）
   std::vector<double> intervals;
   for (size_t i = 1; i < frames.size(); ++i) {
-    auto delta = frames[i].timestamp - frames[i - 1].timestamp;
+    auto delta = frames[i].capture_ts - frames[i - 1].capture_ts;
     intervals.push_back(delta / 1000.0);
   }
 
@@ -79,7 +190,7 @@ void analyze_and_plot_intervals(std::vector<FrameData> &frames,
   variance /= (intervals.size() - 1);
 
   // 平均帧率（帧/秒）
-  auto total_duration = frames.back().timestamp - frames[0].timestamp;
+  auto total_duration = frames.back().capture_ts - frames[0].capture_ts;
   double avg_fps = (frames.size() - 1) / (total_duration / 1e6);
 
   // 输出统计结果
@@ -106,6 +217,8 @@ void analyze_and_plot_intervals(std::vector<FrameData> &frames,
 
 int main() {
   enable_realtime();
+
+  AsyncProcessor processor(WIDTH, HEIGHT);
 
   // 打开设备
   int fd = open(DEVICE, O_RDWR);
@@ -225,6 +338,28 @@ int main() {
 
     // 此处添加图像处理代码
     // process_image(buffers[buf.index].start);
+    cv::Mat yuv = cv::Mat(HEIGHT, WIDTH, CV_8UC2, buffers[buf.index].start);
+    cv::Mat rgb = cv::Mat(HEIGHT, WIDTH, CV_8UC3);
+    FrameData f;
+    f.capture_ts = hw_us;
+    f.yuv = yuv.clone();
+    f.rgb = rgb;
+    f.width = WIDTH;
+    f.height = HEIGHT;
+
+    processor.input(f);
+
+    FrameData f2;
+    processor.get_result(f2);
+
+    printf("the res tp %ld us\n", f2.capture_ts);
+    std::cout << f2.rgb.size() << std::endl;
+    if(f2.rgb.empty()) {
+      continue;
+    }
+
+    // cv::imshow("rgb", f2.rgb);
+    // cv::waitKey(1);
 
     // 重新入队缓冲区
     if (ioctl(fd, VIDIOC_QBUF, &buf) == -1) {

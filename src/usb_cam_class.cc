@@ -119,27 +119,44 @@ private:
   }
 
   cv::UMat create_umat_from_ptr(void *ptr, int rows, int cols, int type) {
-    cl_context ctx = (cl_context)cv::ocl::Context::getDefault().ptr();
-    cl_mem cl_buffer =
-        clCreateBuffer(ctx, CL_MEM_USE_HOST_PTR,
-                       rows * cols * CV_ELEM_SIZE(type), ptr, nullptr);
+    // 将YUV数据包装成Host端的Mat（不复制数据）
+    cv::Mat yuyv_host(rows, cols, CV_8UC2, const_cast<void *>(ptr));
 
-    cv::UMat umat;
-    umat.create(rows, cols, type);
-    umat.u->handle = cl_buffer;
-    umat.u->currAllocator = cv::ocl::getOpenCLAllocator();
-    return umat;
+    // 创建UMat时使用USE_OPENCL标志，OpenCL会自动处理内存映射
+    return yuyv_host.getUMat(cv::ACCESS_FAST);
   }
 
   cv::Mat yuyv_to_bgr_cl(const void *yuyv_data) {
-    cv::UMat yuyv_mat = create_umat_from_ptr((void *)yuyv_data, CAPTURE_HEIGHT,
-                                             CAPTURE_WIDTH, CV_8UC2);
+    auto start = std::chrono::high_resolution_clock::now();
+    cv::Mat yuyv_host(CAPTURE_HEIGHT, CAPTURE_WIDTH, CV_8UC2,
+                      (void *)yuyv_data);
+    cv::UMat yuyv_umat = yuyv_host.getUMat(cv::ACCESS_READ);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::cout << "host->device cost: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                       start)
+                     .count()
+              << "us" << std::endl;
 
     cv::UMat bgr_umat;
-    cv::cvtColor(yuyv_mat, bgr_umat, cv::COLOR_YUV2BGR_YUYV);
+    start = std::chrono::high_resolution_clock::now();
+    cv::cvtColor(yuyv_umat, bgr_umat, cv::COLOR_YUV2BGR_YUYV);
+    end = std::chrono::high_resolution_clock::now();
+    std::cout << "only the cl convert cost: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                       start)
+                     .count()
+              << "us" << std::endl;
 
     cv::Mat bgr;
+    start = std::chrono::high_resolution_clock::now();
     bgr_umat.copyTo(bgr);
+    end = std::chrono::high_resolution_clock::now();
+    std::cout << "device->host cost: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                       start)
+                     .count()
+              << "us" << std::endl;
     return bgr;
   }
 
@@ -246,11 +263,11 @@ public:
                 << std::endl;
 
       auto begin_cl = high_resolution_clock::now();
-      // cv::Mat bgr_cl = yuyv_to_bgr_cl(buffers_[buf.index].start);
+      cv::Mat bgr_cl = yuyv_to_bgr_cl(buffers_[buf.index].start);
       auto end_cl = high_resolution_clock::now();
       std::cout << "cl convert cost:"
-                << duration_cast<microseconds>(end_cl - begin_cl).count() << " us"
-                << std::endl;
+                << duration_cast<microseconds>(end_cl - begin_cl).count()
+                << " us" << std::endl;
 
       frames.push_back({temp_us + toEpochOffset_us});
 
