@@ -33,6 +33,7 @@ struct FrameData {
   cv::Mat yuv;
   int width;
   int height;
+  uint64_t id{0};
 };
 
 class AsyncProcessor {
@@ -173,16 +174,18 @@ public:
       frame = output_queue_.front();
       output_queue_.pop();
 
-      std::cout << "cl_buf.size() = " << cl_in_bufs_.size() << std::endl;
-      std::cout << "cl_out_buf.size() = " << cl_out_bufs_.size() << std::endl;
-      std::cout << "cl_upload_events.size() = " << cl_upload_events_.size()
-                << std::endl;
-      std::cout << "cl_kernel_events.size() = " << cl_kernel_events_.size()
-                << std::endl;
-      std::cout << "cl_download_events.size() = " << cl_download_events_.size()
-                << std::endl;
-      std::cout << "output_queue.size() = " << output_queue_.size()
-                << std::endl;
+      // std::cout << "cl_buf.size() = " << cl_in_bufs_.size() << std::endl;
+      // std::cout << "cl_out_buf.size() = " << cl_out_bufs_.size() <<
+      // std::endl; std::cout << "cl_upload_events.size() = " <<
+      // cl_upload_events_.size()
+      //           << std::endl;
+      // std::cout << "cl_kernel_events.size() = " << cl_kernel_events_.size()
+      //           << std::endl;
+      // std::cout << "cl_download_events.size() = " <<
+      // cl_download_events_.size()
+      //           << std::endl;
+      // std::cout << "output_queue.size() = " << output_queue_.size()
+      //           << std::endl;
 
       return true;
     }
@@ -380,6 +383,7 @@ int main() {
   frames2.reserve(num_frames);
 
   while (i++ < num_frames) {
+    std::cout << "-------------" << std::endl;
     // 获取帧数据
     struct v4l2_buffer buf = {0};
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -399,27 +403,33 @@ int main() {
 
     uint64_t hw_us = 1e6 * buf.timestamp.tv_sec + buf.timestamp.tv_usec;
     frames2.push_back({hw_us});
-    printf("the hw tp %ld us\n", hw_us);
 
     // 此处添加图像处理代码
     // process_image(buffers[buf.index].start);
     cv::Mat yuv = cv::Mat(HEIGHT, WIDTH, CV_8UC2, buffers[buf.index].start);
     cv::Mat rgb = cv::Mat(HEIGHT, WIDTH, CV_8UC3);
-    std::cout << rgb.size() << std::endl;
     FrameData f;
     f.capture_ts = hw_us;
     f.yuv = yuv.clone();
     f.rgb = rgb;
     f.width = WIDTH;
     f.height = HEIGHT;
+    f.id = i;
+    printf("img id %ld capture_ts is %ld us\n", f.id, f.capture_ts);
 
     processor.input(f);
 
+    std::chrono::time_point s_2 = std::chrono::high_resolution_clock::now();
     FrameData f2;
     processor.get_result(f2);
+    std::chrono::time_point e_2 = std::chrono::high_resolution_clock::now();
+    std::cout << "get image use "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(e_2 -
+                                                                       s_2)
+                     .count()
+              << "us" << std::endl;
 
-    printf("the res tp %ld us\n", f2.capture_ts);
-    std::cout << f2.rgb.size() << std::endl;
+    printf("get img id %ld capture_ts is %ld us\n", f2.id, f2.capture_ts);
     if (f2.rgb.empty()) {
       continue;
     }
