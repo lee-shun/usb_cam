@@ -1,7 +1,7 @@
 #include <CL/cl2.hpp>
+#include <fstream>
 #include <memory>
 #include <opencv2/opencv.hpp>
-#include <fstream>
 
 #include "matplotlibcpp.h"
 #include <algorithm>
@@ -40,20 +40,73 @@ public:
   AsyncProcessor(int width, int height) : width_(width), height_(height) {
     cl::Device device = cl::Device::getDefault();
     context_ = cl::Context(device);
-    cl_com_queue_ = cl::CommandQueue(context_, device,
-                                     CL_QUEUE_PROFILING_ENABLE);
+    cl_com_queue_ =
+        cl::CommandQueue(context_, device, CL_QUEUE_PROFILING_ENABLE);
 
-    std::ifstream kernel_file("yuv_rgb.cl");
-    std::string src(std::istreambuf_iterator<char>(kernel_file),
-                    (std::istreambuf_iterator<char>()));
-    auto program_ = cl::Program(context_, src);
-    program_.build();
-    kernel_ = cl::Kernel(program_, "yuv2rgb");
+    const char *kernelCode = R"(
+            __kernel void yuyv_to_rgb(__global const uchar* yuyv_buffer, 
+                                    __global uchar* rgb_buffer,
+                                    int width,
+                                    int height) 
+            {
+                int x = get_global_id(0);
+                int y = get_global_id(1);
 
-    std::cout << "before compile" << std::endl;
-    program_.build();
-    std::cout << "after compile" << std::endl;
+                if (x >= width / 2 || y >= height)
+                    return;
 
+                int block_index = y * (width / 2) + x;
+                uchar4 yuyv = vload4(block_index, yuyv_buffer);
+
+                uchar Y0 = yuyv.s0;
+                uchar U  = yuyv.s1;
+                uchar Y1 = yuyv.s2;
+                uchar V  = yuyv.s3;
+
+                float u = (float)U - 128.0f;
+                float v = (float)V - 128.0f;
+
+                float y0 = (float)Y0;
+                float y1 = (float)Y1;
+
+                float r0 = y0 + 1.403f * v;
+                float g0 = y0 - 0.344f * u - 0.714f * v;
+                float b0 = y0 + 1.773f * u;
+
+                float r1 = y1 + 1.403f * v;
+                float g1 = y1 - 0.344f * u - 0.714f * v;
+                float b1 = y1 + 1.773f * u;
+
+                uchar3 rgb0 = (uchar3)(
+                    clamp(r0, 0.0f, 255.0f),
+                    clamp(g0, 0.0f, 255.0f),
+                    clamp(b0, 0.0f, 255.0f)
+                );
+
+                uchar3 rgb1 = (uchar3)(
+                    clamp(r1, 0.0f, 255.0f),
+                    clamp(g1, 0.0f, 255.0f),
+                    clamp(b1, 0.0f, 255.0f)
+                );
+
+                int out_index = (y * width + 2 * x) * 3;
+                vstore3(rgb0, 0, rgb_buffer + out_index);
+                vstore3(rgb1, 0, rgb_buffer + out_index + 3);
+            }
+        )";
+
+    cl::Program::Sources sources;
+    sources.push_back({kernelCode, strlen(kernelCode)});
+
+    auto program_ = cl::Program(context_, sources);
+    std::cerr << "构建日志:\n"
+              << program_.getBuildInfo<CL_PROGRAM_BUILD_LOG>(device)
+              << std::endl;
+    if (program_.build({device}) != CL_SUCCESS) {
+      throw std::runtime_error("OpenCL程序构建失败");
+    }
+
+    kernel_ = cl::Kernel(program_, "yuyv_to_rgb");
   }
 
   bool input(FrameData &frame) {
@@ -67,9 +120,10 @@ public:
 
     // upload data
     auto upload_event = std::make_shared<cl::Event>();
-    cl_com_queue_.enqueueWriteBuffer(
-        cl_in_bufs_.back(), CL_FALSE, 0, width_ * height_ * 2,
-        frame.yuv.data, nullptr, upload_event.get());
+    cl_com_queue_.enqueueWriteBuffer(cl_in_bufs_.back(), CL_FALSE, 0,
+                                     frame.yuv.total() * frame.yuv.elemSize(),
+                                     frame.yuv.data, nullptr,
+                                     upload_event.get());
     cl_upload_events_.push(upload_event);
 
     // execute kernel
@@ -80,16 +134,17 @@ public:
     kernel_.setArg(3, height_);
     std::vector<cl::Event> up_events = {*upload_event};
     cl_com_queue_.enqueueNDRangeKernel(
-        kernel_, cl::NullRange, cl::NDRange(width_/2, height_), cl::NullRange,
+        kernel_, cl::NullRange, cl::NDRange(width_ / 2, height_), cl::NullRange,
         &up_events, kernel_event.get());
     cl_kernel_events_.push(kernel_event);
 
     // download
     auto download_event = std::make_shared<cl::Event>();
     std::vector<cl::Event> k_events = {*kernel_event};
-    cl_com_queue_.enqueueReadBuffer(
-        cl_out_bufs_.back(), CL_FALSE, 0, width_ * height_ * 3,
-        frame.rgb.data, &k_events, download_event.get());
+    cl_com_queue_.enqueueReadBuffer(cl_out_bufs_.back(), CL_FALSE, 0,
+                                    frame.rgb.total() * frame.rgb.elemSize(),
+                                    frame.rgb.data, &k_events,
+                                    download_event.get());
     cl_download_events_.push(download_event);
     output_queue_.push(frame);
     return true;
@@ -118,6 +173,17 @@ public:
       frame = output_queue_.front();
       output_queue_.pop();
 
+      std::cout << "cl_buf.size() = " << cl_in_bufs_.size() << std::endl;
+      std::cout << "cl_out_buf.size() = " << cl_out_bufs_.size() << std::endl;
+      std::cout << "cl_upload_events.size() = " << cl_upload_events_.size()
+                << std::endl;
+      std::cout << "cl_kernel_events.size() = " << cl_kernel_events_.size()
+                << std::endl;
+      std::cout << "cl_download_events.size() = " << cl_download_events_.size()
+                << std::endl;
+      std::cout << "output_queue.size() = " << output_queue_.size()
+                << std::endl;
+
       return true;
     }
     return false;
@@ -132,11 +198,10 @@ private:
 
   std::mutex que_mutex_;
   std::queue<FrameData> output_queue_;
-  std::queue<cl::Buffer> cl_in_bufs_,cl_out_bufs_;
+  std::queue<cl::Buffer> cl_in_bufs_, cl_out_bufs_;
   std::queue<std::shared_ptr<cl::Event>> cl_upload_events_, cl_kernel_events_,
       cl_download_events_;
 };
-
 
 // 实时性设置
 void enable_realtime() {
@@ -340,6 +405,7 @@ int main() {
     // process_image(buffers[buf.index].start);
     cv::Mat yuv = cv::Mat(HEIGHT, WIDTH, CV_8UC2, buffers[buf.index].start);
     cv::Mat rgb = cv::Mat(HEIGHT, WIDTH, CV_8UC3);
+    std::cout << rgb.size() << std::endl;
     FrameData f;
     f.capture_ts = hw_us;
     f.yuv = yuv.clone();
@@ -354,12 +420,12 @@ int main() {
 
     printf("the res tp %ld us\n", f2.capture_ts);
     std::cout << f2.rgb.size() << std::endl;
-    if(f2.rgb.empty()) {
+    if (f2.rgb.empty()) {
       continue;
     }
 
-    // cv::imshow("rgb", f2.rgb);
-    // cv::waitKey(1);
+    cv::imshow("rgb", f2.rgb);
+    cv::waitKey(1);
 
     // 重新入队缓冲区
     if (ioctl(fd, VIDIOC_QBUF, &buf) == -1) {

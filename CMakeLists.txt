@@ -22,6 +22,7 @@ add_executable(usb_cam_class src/usb_cam_class.cc)
 add_executable(latency_test src/latency_test.cc)
 add_executable(test_queue src/test_queue.cc)
 add_executable(opencl_pipeline src/opencl_pipeline.cc)
+add_executable(opencl_sync src/opencl_sync.cc)
 
 # 链接库
 target_link_libraries(usb_cam
@@ -51,6 +52,13 @@ target_link_libraries(test_queue
     rt
 )
 target_link_libraries(opencl_pipeline
+    ${OpenCV_LIBS}
+    ${OpenCL_LIBRARIES}
+    ${Python_LIBRARIES}
+    pthread
+    rt
+)
+target_link_libraries(opencl_sync
     ${OpenCV_LIBS}
     ${OpenCL_LIBRARIES}
     ${Python_LIBRARIES}
