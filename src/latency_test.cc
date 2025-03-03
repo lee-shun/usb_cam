@@ -20,7 +20,11 @@ void precise_usleep(long us) {
       struct timespec req = {0, target_ns - elapsed};
       nanosleep(&req, nullptr); // 大于10微秒使用系统休眠
     } else {
-      __asm__ __volatile__("pause" ::: "memory"); // 短时忙等
+#if defined(__x86_64__) || defined(__i386__)
+      __asm__ __volatile__("pause" ::: "memory");
+#elif defined(__arm__) || defined(__aarch64__)
+      __asm__ __volatile__("yield" ::: "memory");
+#endif
     }
   }
 }
